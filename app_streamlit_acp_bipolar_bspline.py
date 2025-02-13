@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-app_streamlit_lda_bipolar_bspline.py
+app_streamlit_acp_bipolar_bspline.py
 
 Cette application Streamlit permet de :
   - Charger un maillage 3D (face) et son fichier de repères (.bnd) du dataset BU3DFE.
@@ -195,7 +195,7 @@ def plot_mesh_and_landmarks(mesh, landmarks, left_index=None, right_index=None):
             z=[landmarks[left_index, 2]],
             mode='markers',
             marker=dict(size=10, color='green'),
-            name=f'Œil intérieur gauche (index {left_index})'
+            name=f'intérieur de l\'Œil gauche (index {left_index})'
         ))
     if right_index is not None and right_index < landmarks.shape[0]:
         fig.add_trace(go.Scatter3d(
@@ -204,7 +204,7 @@ def plot_mesh_and_landmarks(mesh, landmarks, left_index=None, right_index=None):
             z=[landmarks[right_index, 2]],
             mode='markers',
             marker=dict(size=10, color='orange'),
-            name=f'Œil intérieur droit (index {right_index})'
+            name=f'intérieur de l\'Œil droit (index {right_index})'
         ))
     fig.update_layout(title="Maillage et repères", scene=dict(aspectmode='data'))
     return fig
@@ -386,7 +386,7 @@ st.sidebar.header("Chargement des fichiers")
 uploaded_mesh = st.sidebar.file_uploader("Maillage (OBJ)", type=["obj"])
 uploaded_bnd = st.sidebar.file_uploader("Repères (.bnd)", type=["bnd"])
 
-st.sidebar.header("Indices des repères (pour les yeux intérieurs)")
+st.sidebar.header("Extraction des 2 Landmarks (points de référence) intérieurs des yeux)")
 ref_left = st.sidebar.number_input("Indice œil intérieur gauche", value=0, step=1)
 ref_right = st.sidebar.number_input("Indice œil intérieur droit", value=8, step=1)
 
@@ -397,9 +397,9 @@ spline_s = st.sidebar.number_input("Paramètre de lissage B-Spline", value=0.0, 
 
 st.sidebar.header("Distances cibles pour les level sets")
 sum_str = st.sidebar.text_input("Target distances (sum)", 
-                                  value="50,78,97,108,119,130,141,152,163,174,181")
+                                  value="50,66,98,114,132,164,181")
 diff_str = st.sidebar.text_input("Target distances (diff)", 
-                                   value="18,19,20,21,22,23,24,25,26,27,28,29,30,35,41,45,50,54,56")
+                                   value="7,20,25,28,30,32,41,42,43")
 try:
     target_distances_sum = [float(x.strip()) for x in sum_str.split(',') if x.strip() != ""]
 except Exception as e:
