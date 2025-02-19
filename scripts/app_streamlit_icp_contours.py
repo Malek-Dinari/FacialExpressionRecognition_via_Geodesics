@@ -7,16 +7,11 @@ Cette application Streamlit permet de :
   - Extraire les repères correspondant aux bords intérieurs des yeux (via indices fournis ou par défaut).
   - Calculer la représentation bipolaire (potentiels géodésiques) en utilisant ces repères.
   - Extraire des contours (level sets) sur le maillage via des distances cibles (entrées manuelles) et une tolérance.
-  - Visualiser tous les contours extraits avant alignement.
-  - Sélectionner une paire de contours pour ICP, pour les "sum" et pour les "diff".
-  - Initialiser l'ICP par translation (basée sur les repères) et aligner les contours sélectionnés.
-  - Visualiser les contours avant et après ICP.
-  - Afficher la matrice de transformation ICP, les métriques (fitness, inlier RMSE) et un histogramme des erreurs.
-
-Quelques notions importantes :
-  - **ICP (Iterative Closest Point)** recherche la transformation (translation et rotation) minimisant la distance entre deux ensembles de points.
-  - **Mesh matching** utilise des caractéristiques (ici, les repères extraits et la représentation bipolaire) pour aligner deux maillages.
-  - La **représentation bipolaire** est définie par les potentiels géodésiques calculés depuis deux repères (les yeux intérieurs). Les level sets sont les ensembles de points où la somme ou la différence des potentiels est constante.
+  - Ordonner, rééchantillonner et interpoler les contours avec des B‑splines.
+    * Pour le level set "sum" : une unique courbe est obtenue.
+    * Pour le level set "diff" : les deux branches (gauche et droite) sont traitées séparément.
+  - Aligner les contours par ICP, soit pour une paire sélectionnée, soit en mode batch.
+  - Visualiser les résultats d'alignement et les métriques ICP.
 
 Auteur : Malek DINARI
 """
@@ -34,12 +29,13 @@ import matplotlib.pyplot as plt
 import tempfile
 import plotly.graph_objs as go
 from io import StringIO
+from scipy.interpolate import splprep, splev  # Pour B-spline
 
 st.title("Alignement ICP sur les contours bipolaires")
 st.markdown("""
 Cette application vous permet d’aligner deux maillages 3D (source et cible) à l’aide de la représentation 
 bipolaire des potentiels géodésiques et de l’algorithme ICP appliqué aux contours extraits (level sets).  
-Les repères utilisés correspondent aux bords intérieurs des yeux.  
+Les repères utilisés correspondent aux bords intérieurs des yeux.
 """)
 
 #######################################
@@ -52,14 +48,6 @@ st.write("Appareil utilisé :", device)
 # Fonctions pour la lecture des repères (.bnd) et extraction des repères
 #######################################
 def read_bnd_file(file_bytes):
-    """
-    Lire un fichier .bnd et retourner les repères (landmarks) sous forme d'un tableau (N, 3).
-
-    Pour BU3D-FE, le fichier est en format texte.
-    Exemple de ligne :
-      7323\t\t-39.6402\t\t47.0837\t\t95.2473
-    La première colonne est un index, les trois suivantes sont X, Y, Z.
-    """
     try:
         text = file_bytes.decode("utf-8")
     except Exception as e:
@@ -88,17 +76,11 @@ def read_bnd_file(file_bytes):
         return None
 
 def find_nearest_vertex(vertices, point):
-    """
-    Trouver l'indice du vertex le plus proche du point donné.
-    """
     diff = vertices - point
     dist = np.linalg.norm(diff, axis=1)
     return np.argmin(dist)
 
 def plot_mesh_and_landmarks(mesh, landmarks, left_index=None, right_index=None):
-    """
-    Afficher le maillage et les repères sur un graphique 3D interactif avec Plotly.
-    """
     vertices = np.array(mesh.vertices)
     faces = np.array(mesh.faces)
     
@@ -145,21 +127,40 @@ def plot_mesh_and_landmarks(mesh, landmarks, left_index=None, right_index=None):
 
 def plot_contours(contours_list, target_list, title="Contours"):
     """
-    Afficher plusieurs ensembles de points (nuages) représentant les contours.
-    Chaque contour est tracé avec une couleur différente.
+    Affiche les contours dans une figure Plotly.
+    Pour le type "diff", chaque contour est attendu sous forme de tuple (left, right).
     """
     fig = go.Figure()
     colors = ['red', 'orange', 'green', 'blue', 'purple', 'magenta', 'brown', 'cyan']
     for i, contour in enumerate(contours_list):
         color = colors[i % len(colors)]
-        fig.add_trace(go.Scatter3d(
-            x=contour[:, 0],
-            y=contour[:, 1],
-            z=contour[:, 2],
-            mode='markers',
-            marker=dict(size=3, color=color),
-            name=f'Contour C={target_list[i]:.2f}'
-        ))
+        if isinstance(contour, (list, tuple)) and len(contour) == 2:
+            left_curve, right_curve = contour
+            fig.add_trace(go.Scatter3d(
+                x=left_curve[:, 0],
+                y=left_curve[:, 1],
+                z=left_curve[:, 2],
+                mode='markers',
+                marker=dict(size=3, color=color),
+                name=f'Diff branche gauche C={target_list[i]:.2f}'
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=right_curve[:, 0],
+                y=right_curve[:, 1],
+                z=right_curve[:, 2],
+                mode='markers',
+                marker=dict(size=3, color=color),
+                name=f'Diff branche droite C={target_list[i]:.2f}'
+            ))
+        else:
+            fig.add_trace(go.Scatter3d(
+                x=contour[:, 0],
+                y=contour[:, 1],
+                z=contour[:, 2],
+                mode='markers',
+                marker=dict(size=3, color=color),
+                name=f'Contour C={target_list[i]:.2f}'
+            ))
     fig.update_layout(title=title, scene=dict(aspectmode='data'))
     return fig
 
@@ -243,7 +244,133 @@ def plot_icp_error_histogram(source_pcd, target_pcd):
     return mean_error, rmse
 
 #######################################
-# Interface Streamlit
+# Fonctions pour l'ordonnancement et interpolation B-spline
+#######################################
+def order_contour_points(points, contour_type="sum"):
+    """
+    Pour le level set "sum", on utilise un NN-ordering pour obtenir une courbe unique.
+    """
+    if len(points) <= 1:
+        return points.copy()
+    
+    if contour_type == "sum":
+        dist_matrix = np.linalg.norm(points[:, np.newaxis] - points, axis=2)
+        i, j = np.unravel_index(np.argmax(dist_matrix), dist_matrix.shape)
+        ordered = []
+        remaining = set(range(len(points)))
+        current = i
+        ordered.append(current)
+        remaining.remove(current)
+        while remaining:
+            nearest = min(remaining, key=lambda x: np.linalg.norm(points[current] - points[x]))
+            ordered.append(nearest)
+            remaining.remove(nearest)
+            current = nearest
+        if ordered[-1] != j:
+            ordered = ordered[::-1]
+        return points[ordered]
+    else:
+        return points  # Ne devrait pas être appelé pour "diff"
+
+def order_diff_contour_points(points):
+    """
+    Divise les points du level set "diff" en deux branches (gauche et droite) 
+    selon la médiane des x, et les ordonne par rapport à la coordonnée y.
+    """
+    centroid = np.mean(points, axis=0)
+    left_mask = points[:, 0] < centroid[0]
+    left_points = points[left_mask]
+    right_points = points[~left_mask]
+    if len(left_points) > 0:
+        left_ordered = left_points[np.argsort(left_points[:, 1])]
+    else:
+        left_ordered = np.empty((0, 3))
+    if len(right_points) > 0:
+        right_ordered = right_points[np.argsort(right_points[:, 1])]
+    else:
+        right_ordered = np.empty((0, 3))
+    return left_ordered, right_ordered
+
+def fit_bspline_curve(points, n_samples=50, s=0, contour_type="sum"):
+    """
+    Pour "sum", ajuste une B-spline sur la courbe ordonnée.
+    """
+    if len(points) < 4:
+        return points, None, None
+    points_ordered = order_contour_points(points, contour_type=contour_type)
+    # Vérifier si le contour est fermé (pour "sum")
+    is_closed = (contour_type == "sum") and (np.linalg.norm(points_ordered[0] - points_ordered[-1]) < 1e-3)
+    k = 3 if len(points_ordered) >= 4 else min(3, len(points_ordered)-1)
+    try:
+        dists = np.linalg.norm(np.diff(points_ordered, axis=0), axis=1)
+        arc_length = np.concatenate(([0], np.cumsum(dists)))
+        arc_length_norm = arc_length / arc_length[-1] if arc_length[-1] != 0 else np.linspace(0, 1, len(points_ordered))
+        tck, u = splprep(points_ordered.T, u=arc_length_norm, s=s, k=k, per=is_closed)
+        u_new = np.linspace(0, 1, n_samples)
+        if is_closed:
+            u_new = u_new[:-1]  # éviter la duplication
+        curve = np.array(splev(u_new, tck)).T
+        return curve, tck, u_new
+    except Exception as e:
+        st.error(f"B-spline error: {str(e)}")
+        return points_ordered, None, None
+
+def fit_bspline_diff_curve(points, n_samples=50, s=0):
+    """
+    Pour le level set "diff", sépare d'abord en deux branches puis ajuste une B-spline pour chacune.
+    Retourne un tuple (left_curve, right_curve).
+    """
+    left_ordered, right_ordered = order_diff_contour_points(points)
+    left_curve = left_ordered
+    right_curve = right_ordered
+    if len(left_ordered) >= 4:
+        try:
+            dists = np.linalg.norm(np.diff(left_ordered, axis=0), axis=1)
+            arc_length = np.concatenate(([0], np.cumsum(dists)))
+            arc_length_norm = arc_length / arc_length[-1] if arc_length[-1] != 0 else np.linspace(0, 1, len(left_ordered))
+            tck_left, _ = splprep(left_ordered.T, u=arc_length_norm, s=s, k=3, per=False)
+            u_new = np.linspace(0, 1, n_samples)
+            left_curve = np.array(splev(u_new, tck_left)).T
+        except Exception as e:
+            st.error(f"B-spline error (left branch): {str(e)}")
+    if len(right_ordered) >= 4:
+        try:
+            dists = np.linalg.norm(np.diff(right_ordered, axis=0), axis=1)
+            arc_length = np.concatenate(([0], np.cumsum(dists)))
+            arc_length_norm = arc_length / arc_length[-1] if arc_length[-1] != 0 else np.linspace(0, 1, len(right_ordered))
+            tck_right, _ = splprep(right_ordered.T, u=arc_length_norm, s=s, k=3, per=False)
+            u_new = np.linspace(0, 1, n_samples)
+            right_curve = np.array(splev(u_new, tck_right)).T
+        except Exception as e:
+            st.error(f"B-spline error (right branch): {str(e)}")
+    return left_curve, right_curve
+
+def process_contours(contours, contour_type, n_samples, s):
+    """
+    Pour chaque contour extrait, applique l'interpolation par B-spline.
+    Pour "sum", renvoie une liste d'arrays.
+    Pour "diff", renvoie une liste de tuples (left_curve, right_curve).
+    """
+    processed = []
+    if contour_type == "sum":
+        for contour in contours:
+            if len(contour) < 4:
+                processed.append(contour)
+            else:
+                curve, _, _ = fit_bspline_curve(contour, n_samples=n_samples, s=s, contour_type=contour_type)
+                processed.append(curve if curve is not None else contour)
+    elif contour_type == "diff":
+        for contour in contours:
+            if len(contour) < 4:
+                # Dupliquer si insuffisant
+                processed.append((contour, contour))
+            else:
+                left_curve, right_curve = fit_bspline_diff_curve(contour, n_samples=n_samples, s=s)
+                processed.append((left_curve, right_curve))
+    return processed
+
+#######################################
+# Interface Streamlit - Chargement et paramètres
 #######################################
 st.sidebar.header("Chargement des fichiers")
 uploaded_source_mesh = st.sidebar.file_uploader("Maillage source (OBJ)", type=["obj"])
@@ -262,7 +389,7 @@ icp_threshold = st.sidebar.slider("Seuil ICP", min_value=0.1, max_value=5.0, val
 icp_max_iter = st.sidebar.slider("Nombre max d'itérations ICP", min_value=10, max_value=200, value=50, step=10)
 contour_tol = st.sidebar.slider("Tolérance pour extraction de contour", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
 
-# Entrées de distances cibles sous forme de liste pour "sum" et "diff"
+st.sidebar.header("Distances cibles")
 source_sum_str = st.sidebar.text_input("Target distances (sum) pour la source", 
                                          value="97,108,119,130,141,152,163,174,185,196,207,218,229")
 source_diff_str = st.sidebar.text_input("Target distances (diff) pour la source", 
@@ -271,6 +398,23 @@ target_sum_str = st.sidebar.text_input("Target distances (sum) pour la cible",
                                          value="97,108,119,130,141,152,163,174,185,196,207,218,229")
 target_diff_str = st.sidebar.text_input("Target distances (diff) pour la cible", 
                                           value="18,19,20,21,22,23,24,25,26,27,28,29,30")
+
+# Paramètres pour B-spline
+st.sidebar.header("Paramètres B-spline")
+n_samples = st.sidebar.slider("Nombre de points pour B-spline", min_value=10, max_value=200, value=50, step=5)
+spline_s = st.sidebar.slider("Smoothing (s) pour B-spline", min_value=0.0, max_value=5.0, value=0.0, step=0.1)
+
+# Mode d'alignement : Individuel ou Batch
+align_mode = st.sidebar.radio("Mode d'alignement", ("Paire unique (sélectionnée)", "Batch ICP (tous les contours)"))
+
+# Pour le mode individuel, sélection de la paire pour "sum"
+if align_mode == "Paire unique (sélectionnée)":
+    selected_pair_sum = st.sidebar.selectbox("Sélectionner la paire de contours 'sum' pour ICP (index)", 
+                                               list(range(min(len(source_sum_str.split(',')), len(target_sum_str.split(','))))))
+    # Pour "diff", on ajoute une sélection de paire ainsi que le choix de branche (left/right)
+    selected_pair_diff = st.sidebar.selectbox("Sélectionner la paire de contours 'diff' pour ICP (index)", 
+                                                list(range(min(len(source_diff_str.split(',')), len(target_diff_str.split(','))))))
+    selected_diff_branch = st.sidebar.radio("Sélectionner la branche pour 'diff'", ("left", "right"))
 
 try:
     target_distances_source_sum = [float(x.strip()) for x in source_sum_str.split(',') if x.strip() != ""]
@@ -292,12 +436,6 @@ try:
 except Exception as e:
     st.error(f"Erreur de parsing des distances cibles cible (diff): {e}")
     target_distances_target_diff = []
-
-# Sélection des paires de contours à aligner pour chaque type
-selected_pair_sum = st.sidebar.selectbox("Sélectionner la paire de contours (sum) pour ICP (index)", 
-                                           list(range(min(len(target_distances_source_sum), len(target_distances_target_sum)))) if target_distances_source_sum and target_distances_target_sum else [0])
-selected_pair_diff = st.sidebar.selectbox("Sélectionner la paire de contours (diff) pour ICP (index)", 
-                                            list(range(min(len(target_distances_source_diff), len(target_distances_target_diff)))) if target_distances_source_diff and target_distances_target_diff else [0])
 
 if st.sidebar.button("Exécuter l'alignement sur les contours"):
     if uploaded_source_mesh and uploaded_source_bnd and uploaded_target_mesh and uploaded_target_bnd:
@@ -353,148 +491,245 @@ if st.sidebar.button("Exécuter l'alignement sur les contours"):
             somme_source, diff_source = compute_bipolar_representation(vertices_source, faces_source, idx_source_left, idx_source_right)
             somme_target, diff_target = compute_bipolar_representation(vertices_target, faces_target, idx_target_left, idx_target_right)
             
-            # Extraire les contours pour "sum" et "diff" pour la source
-            contours_source_sum = []
-            for c in target_distances_source_sum:
-                cs = extract_contour(mesh_source, somme_source.numpy(), c, tol=contour_tol)
-                contours_source_sum.append(cs)
-            contours_source_diff = []
-            for c in target_distances_source_diff:
-                cd = extract_contour(mesh_source, diff_source.numpy(), c, tol=contour_tol)
-                contours_source_diff.append(cd)
+            # Extraction des contours pour "sum" et "diff"
+            contours_source_sum = [extract_contour(mesh_source, somme_source.numpy(), c, tol=contour_tol) for c in target_distances_source_sum]
+            contours_source_diff = [extract_contour(mesh_source, diff_source.numpy(), c, tol=contour_tol) for c in target_distances_source_diff]
+            contours_target_sum = [extract_contour(mesh_target, somme_target.numpy(), c, tol=contour_tol) for c in target_distances_target_sum]
+            contours_target_diff = [extract_contour(mesh_target, diff_target.numpy(), c, tol=contour_tol) for c in target_distances_target_diff]
             
-            # Extraire les contours pour "sum" et "diff" pour la cible
-            contours_target_sum = []
-            for c in target_distances_target_sum:
-                ct = extract_contour(mesh_target, somme_target.numpy(), c, tol=contour_tol)
-                contours_target_sum.append(ct)
-            contours_target_diff = []
-            for c in target_distances_target_diff:
-                cd = extract_contour(mesh_target, diff_target.numpy(), c, tol=contour_tol)
-                contours_target_diff.append(cd)
+            # Appliquer l'ordonnancement et l'interpolation B-spline
+            contours_source_sum_bspline = process_contours(contours_source_sum, "sum", n_samples, spline_s)
+            contours_target_sum_bspline = process_contours(contours_target_sum, "sum", n_samples, spline_s)
+            contours_source_diff_bspline = process_contours(contours_source_diff, "diff", n_samples, spline_s)
+            contours_target_diff_bspline = process_contours(contours_target_diff, "diff", n_samples, spline_s)
             
-            # Visualiser les contours extraits pour la source et la cible
-            st.write("[INFO] Visualisation des contours 'sum' pour la source")
-            fig_source_sum = plot_contours(contours_source_sum, target_distances_source_sum, title="Contours source (sum)")
+            # Visualisation des contours interpolés
+            st.write("[INFO] Visualisation des contours 'sum' pour la source (B-spline)")
+            fig_source_sum = plot_contours(contours_source_sum_bspline, target_distances_source_sum, title="Contours source (sum)")
             st.plotly_chart(fig_source_sum, use_container_width=True)
-            st.write("[INFO] Visualisation des contours 'diff' pour la source")
-            fig_source_diff = plot_contours(contours_source_diff, target_distances_source_diff, title="Contours source (diff)")
+            st.write("[INFO] Visualisation des contours 'diff' pour la source (B-spline)")
+            fig_source_diff = plot_contours(contours_source_diff_bspline, target_distances_source_diff, title="Contours source (diff)")
             st.plotly_chart(fig_source_diff, use_container_width=True)
-            st.write("[INFO] Visualisation des contours 'sum' pour la cible")
-            fig_target_sum = plot_contours(contours_target_sum, target_distances_target_sum, title="Contours cible (sum)")
+            st.write("[INFO] Visualisation des contours 'sum' pour la cible (B-spline)")
+            fig_target_sum = plot_contours(contours_target_sum_bspline, target_distances_target_sum, title="Contours cible (sum)")
             st.plotly_chart(fig_target_sum, use_container_width=True)
-            st.write("[INFO] Visualisation des contours 'diff' pour la cible")
-            fig_target_diff = plot_contours(contours_target_diff, target_distances_target_diff, title="Contours cible (diff)")
+            st.write("[INFO] Visualisation des contours 'diff' pour la cible (B-spline)")
+            fig_target_diff = plot_contours(contours_target_diff_bspline, target_distances_target_diff, title="Contours cible (diff)")
             st.plotly_chart(fig_target_diff, use_container_width=True)
             
-            # Sélectionner la paire de contours pour ICP pour "sum" et pour "diff"
-            selected_pair_sum = st.sidebar.selectbox("Sélectionner la paire de contours 'sum' pour ICP (index)", 
-                                                       list(range(min(len(target_distances_source_sum), len(target_distances_target_sum)))) if target_distances_source_sum and target_distances_target_sum else [0])
-            selected_pair_diff = st.sidebar.selectbox("Sélectionner la paire de contours 'diff' pour ICP (index)", 
-                                                        list(range(min(len(target_distances_source_diff), len(target_distances_target_diff)))) if target_distances_source_diff and target_distances_target_diff else [0])
-            
-            st.write(f"[INFO] Utilisation de la paire de contours 'sum' d'indice {selected_pair_sum} pour ICP")
-            selected_contour_source_sum = contours_source_sum[selected_pair_sum]
-            selected_contour_target_sum = contours_target_sum[selected_pair_sum]
-            
-            st.write(f"[INFO] Utilisation de la paire de contours 'diff' d'indice {selected_pair_diff} pour ICP")
-            selected_contour_source_diff = contours_source_diff[selected_pair_diff]
-            selected_contour_target_diff = contours_target_diff[selected_pair_diff]
-            
-            # Visualisation pré-alignement
-            pre_align_fig_sum = plot_contours([selected_contour_source_sum, selected_contour_target_sum], 
-                                               [target_distances_source_sum[selected_pair_sum], target_distances_target_sum[selected_pair_sum]],
-                                               title="Contours 'sum' sélectionnés avant ICP")
-            st.plotly_chart(pre_align_fig_sum, use_container_width=True)
-            pre_align_fig_diff = plot_contours([selected_contour_source_diff, selected_contour_target_diff], 
-                                                [target_distances_source_diff[selected_pair_diff], target_distances_target_diff[selected_pair_diff]],
-                                                title="Contours 'diff' sélectionnés avant ICP")
-            st.plotly_chart(pre_align_fig_diff, use_container_width=True)
-            
-            # Calcul de la translation initiale (basée sur les repères)
+            # Calcul de la translation initiale basée sur les repères
             mean_source = (ref_source_left + ref_source_right) / 2.0
             mean_target = (ref_target_left + ref_target_right) / 2.0
             initial_translation = mean_target - mean_source
             st.write("[INFO] Translation initiale basée sur les repères:", initial_translation)
             
-            # Appliquer la translation initiale aux contours sources sélectionnés
-            selected_contour_source_sum_aligned = selected_contour_source_sum + initial_translation
-            selected_contour_source_diff_aligned = selected_contour_source_diff + initial_translation
-            
-            # Exécuter l'ICP pour "sum"
-            transformation_icp_sum, reg_result_sum, src_pcd_sum, tgt_pcd_sum = icp_registration_pointcloud(
-                selected_contour_source_sum_aligned, selected_contour_target_sum, threshold=icp_threshold, max_iter=icp_max_iter)
-            st.write("Matrice de transformation ICP finale (sum):")
-            st.write(transformation_icp_sum)
-            st.write(f"Fitness (sum): {reg_result_sum.fitness:.4f}")
-            st.write(f"Inlier RMSE (sum): {reg_result_sum.inlier_rmse:.4f}")
-            
-            # Exécuter l'ICP pour "diff"
-            transformation_icp_diff, reg_result_diff, src_pcd_diff, tgt_pcd_diff = icp_registration_pointcloud(
-                selected_contour_source_diff_aligned, selected_contour_target_diff, threshold=icp_threshold, max_iter=icp_max_iter)
-            st.write("Matrice de transformation ICP finale (diff):")
-            st.write(transformation_icp_diff)
-            st.write(f"Fitness (diff): {reg_result_diff.fitness:.4f}")
-            st.write(f"Inlier RMSE (diff): {reg_result_diff.inlier_rmse:.4f}")
-            
-            # Visualisation post-alignement pour "sum"
-            src_points_aligned_sum = np.asarray(src_pcd_sum.points)
-            post_align_fig_sum = go.Figure()
-            post_align_fig_sum.add_trace(go.Scatter3d(
-                x=src_points_aligned_sum[:, 0],
-                y=src_points_aligned_sum[:, 1],
-                z=src_points_aligned_sum[:, 2],
-                mode='markers',
-                marker=dict(size=3, color='red'),
-                name='Contour source (sum) après ICP'
-            ))
-            post_align_fig_sum.add_trace(go.Scatter3d(
-                x=selected_contour_target_sum[:, 0],
-                y=selected_contour_target_sum[:, 1],
-                z=selected_contour_target_sum[:, 2],
-                mode='markers',
-                marker=dict(size=3, color='blue'),
-                name='Contour cible (sum)'
-            ))
-            post_align_fig_sum.update_layout(title="Contours 'sum' après ICP", scene=dict(aspectmode='data'))
-            st.plotly_chart(post_align_fig_sum, use_container_width=True)
-            
-            # Visualisation post-alignement pour "diff"
-            src_points_aligned_diff = np.asarray(src_pcd_diff.points)
-            post_align_fig_diff = go.Figure()
-            post_align_fig_diff.add_trace(go.Scatter3d(
-                x=src_points_aligned_diff[:, 0],
-                y=src_points_aligned_diff[:, 1],
-                z=src_points_aligned_diff[:, 2],
-                mode='markers',
-                marker=dict(size=3, color='red'),
-                name='Contour source (diff) après ICP'
-            ))
-            post_align_fig_diff.add_trace(go.Scatter3d(
-                x=selected_contour_target_diff[:, 0],
-                y=selected_contour_target_diff[:, 1],
-                z=selected_contour_target_diff[:, 2],
-                mode='markers',
-                marker=dict(size=3, color='blue'),
-                name='Contour cible (diff)'
-            ))
-            post_align_fig_diff.update_layout(title="Contours 'diff' après ICP", scene=dict(aspectmode='data'))
-            st.plotly_chart(post_align_fig_diff, use_container_width=True)
-            
-            # Tracer l'histogramme des erreurs ICP pour "sum" et "diff"
-            st.write("[INFO] Erreurs ICP pour le type 'sum':")
-            mean_error_sum, rmse_sum = plot_icp_error_histogram(src_pcd_sum, tgt_pcd_sum)
-            st.write(f"[INFO] RMSE (sum): {rmse_sum:.4f}")
-            
-            st.write("[INFO] Erreurs ICP pour le type 'diff':")
-            mean_error_diff, rmse_diff = plot_icp_error_histogram(src_pcd_diff, tgt_pcd_diff)
-            st.write(f"[INFO] RMSE (diff): {rmse_diff:.4f}")
+            if align_mode == "Paire unique (sélectionnée)":
+                # Sélection pour "sum"
+                st.write(f"[INFO] Utilisation de la paire de contours 'sum' d'indice {selected_pair_sum} pour ICP")
+                selected_contour_source_sum = contours_source_sum_bspline[selected_pair_sum]
+                selected_contour_target_sum = contours_target_sum_bspline[selected_pair_sum]
+                
+                # Pour "diff", sélection selon la branche choisie
+                st.write(f"[INFO] Utilisation de la paire de contours 'diff' d'indice {selected_pair_diff} pour ICP, branche {selected_diff_branch}")
+                diff_source_tuple = contours_source_diff_bspline[selected_pair_diff]  # (left, right)
+                diff_target_tuple = contours_target_diff_bspline[selected_pair_diff]
+                if selected_diff_branch == "left":
+                    selected_contour_source_diff = diff_source_tuple[0]
+                    selected_contour_target_diff = diff_target_tuple[0]
+                else:
+                    selected_contour_source_diff = diff_source_tuple[1]
+                    selected_contour_target_diff = diff_target_tuple[1]
+                
+                # Visualisation pré-alignement
+                pre_align_fig_sum = plot_contours([selected_contour_source_sum, selected_contour_target_sum], 
+                                                   [target_distances_source_sum[selected_pair_sum], target_distances_target_sum[selected_pair_sum]],
+                                                   title="Contours 'sum' sélectionnés avant ICP")
+                st.plotly_chart(pre_align_fig_sum, use_container_width=True)
+                pre_align_fig_diff = plot_contours([selected_contour_source_diff, selected_contour_target_diff], 
+                                                    [target_distances_source_diff[selected_pair_diff], target_distances_target_diff[selected_pair_diff]],
+                                                    title="Contours 'diff' sélectionnés avant ICP")
+                st.plotly_chart(pre_align_fig_diff, use_container_width=True)
+                
+                # Appliquer la translation initiale aux contours sélectionnés
+                src_sum_aligned_init = selected_contour_source_sum + initial_translation
+                src_diff_aligned_init = selected_contour_source_diff + initial_translation
+                
+                # ICP pour "sum"
+                transformation_icp_sum, reg_result_sum, src_pcd_sum, tgt_pcd_sum = icp_registration_pointcloud(
+                    src_sum_aligned_init, selected_contour_target_sum, threshold=icp_threshold, max_iter=icp_max_iter)
+                st.write("Matrice de transformation ICP finale (sum):")
+                st.write(transformation_icp_sum)
+                st.write(f"Fitness (sum): {reg_result_sum.fitness:.4f}")
+                st.write(f"Inlier RMSE (sum): {reg_result_sum.inlier_rmse:.4f}")
+                
+                # ICP pour "diff"
+                transformation_icp_diff, reg_result_diff, src_pcd_diff, tgt_pcd_diff = icp_registration_pointcloud(
+                    src_diff_aligned_init, selected_contour_target_diff, threshold=icp_threshold, max_iter=icp_max_iter)
+                st.write("Matrice de transformation ICP finale (diff):")
+                st.write(transformation_icp_diff)
+                st.write(f"Fitness (diff): {reg_result_diff.fitness:.4f}")
+                st.write(f"Inlier RMSE (diff): {reg_result_diff.inlier_rmse:.4f}")
+                
+                # Visualisation post-alignement pour "sum"
+                src_points_aligned_sum = np.asarray(src_pcd_sum.points)
+                post_align_fig_sum = go.Figure()
+                post_align_fig_sum.add_trace(go.Scatter3d(
+                    x=src_points_aligned_sum[:, 0],
+                    y=src_points_aligned_sum[:, 1],
+                    z=src_points_aligned_sum[:, 2],
+                    mode='markers',
+                    marker=dict(size=3, color='red'),
+                    name='Contour source (sum) après ICP'
+                ))
+                post_align_fig_sum.add_trace(go.Scatter3d(
+                    x=selected_contour_target_sum[:, 0],
+                    y=selected_contour_target_sum[:, 1],
+                    z=selected_contour_target_sum[:, 2],
+                    mode='markers',
+                    marker=dict(size=3, color='blue'),
+                    name='Contour cible (sum)'
+                ))
+                post_align_fig_sum.update_layout(title="Contours 'sum' après ICP", scene=dict(aspectmode='data'))
+                st.plotly_chart(post_align_fig_sum, use_container_width=True)
+                
+                # Visualisation post-alignement pour "diff"
+                src_points_aligned_diff = np.asarray(src_pcd_diff.points)
+                post_align_fig_diff = go.Figure()
+                post_align_fig_diff.add_trace(go.Scatter3d(
+                    x=src_points_aligned_diff[:, 0],
+                    y=src_points_aligned_diff[:, 1],
+                    z=src_points_aligned_diff[:, 2],
+                    mode='markers',
+                    marker=dict(size=3, color='red'),
+                    name='Contour source (diff) après ICP'
+                ))
+                post_align_fig_diff.add_trace(go.Scatter3d(
+                    x=selected_contour_target_diff[:, 0],
+                    y=selected_contour_target_diff[:, 1],
+                    z=selected_contour_target_diff[:, 2],
+                    mode='markers',
+                    marker=dict(size=3, color='blue'),
+                    name='Contour cible (diff)'
+                ))
+                post_align_fig_diff.update_layout(title="Contours 'diff' après ICP", scene=dict(aspectmode='data'))
+                st.plotly_chart(post_align_fig_diff, use_container_width=True)
+                
+                # Histogrammes des erreurs ICP
+                st.write("[INFO] Erreurs ICP pour le type 'sum':")
+                mean_error_sum, rmse_sum = plot_icp_error_histogram(src_pcd_sum, tgt_pcd_sum)
+                st.write(f"[INFO] RMSE (sum): {rmse_sum:.4f}")
+                
+                st.write("[INFO] Erreurs ICP pour le type 'diff':")
+                mean_error_diff, rmse_diff = plot_icp_error_histogram(src_pcd_diff, tgt_pcd_diff)
+                st.write(f"[INFO] RMSE (diff): {rmse_diff:.4f}")
+                
+            else:  # Batch ICP mode
+                st.write("[INFO] Exécution du Batch ICP sur tous les contours (B-spline appliquée)")
+                
+                # Pour "sum"
+                aligned_contours_sum = []
+                metrics_sum = []
+                for i in range(len(contours_source_sum_bspline)):
+                    source_curve = contours_source_sum_bspline[i] + initial_translation
+                    target_curve = contours_target_sum_bspline[i]
+                    T, reg_result, src_pcd, tgt_pcd = icp_registration_pointcloud(source_curve, target_curve, threshold=icp_threshold, max_iter=icp_max_iter)
+                    aligned_contours_sum.append(np.asarray(src_pcd.points))
+                    metrics_sum.append((reg_result.fitness, reg_result.inlier_rmse))
+                
+                # Pour "diff", traiter séparément les branches gauche et droite
+                aligned_diff_left = []
+                aligned_diff_right = []
+                metrics_diff_left = []
+                metrics_diff_right = []
+                for i in range(len(contours_source_diff_bspline)):
+                    src_left, src_right = contours_source_diff_bspline[i]
+                    tgt_left, tgt_right = contours_target_diff_bspline[i]
+                    # ICP pour la branche gauche
+                    T_left, reg_result_left, src_pcd_left, tgt_pcd_left = icp_registration_pointcloud(src_left + initial_translation, tgt_left, threshold=icp_threshold, max_iter=icp_max_iter)
+                    aligned_diff_left.append(np.asarray(src_pcd_left.points))
+                    metrics_diff_left.append((reg_result_left.fitness, reg_result_left.inlier_rmse))
+                    # ICP pour la branche droite
+                    T_right, reg_result_right, src_pcd_right, tgt_pcd_right = icp_registration_pointcloud(src_right + initial_translation, tgt_right, threshold=icp_threshold, max_iter=icp_max_iter)
+                    aligned_diff_right.append(np.asarray(src_pcd_right.points))
+                    metrics_diff_right.append((reg_result_right.fitness, reg_result_right.inlier_rmse))
+                
+                # Visualisation agrégée pour "sum"
+                batch_fig_sum = go.Figure()
+                for i, curve in enumerate(aligned_contours_sum):
+                    batch_fig_sum.add_trace(go.Scatter3d(
+                        x=curve[:, 0],
+                        y=curve[:, 1],
+                        z=curve[:, 2],
+                        mode='markers',
+                        marker=dict(size=3, color='red'),
+                        name=f'Source ICP {i}'
+                    ))
+                    batch_fig_sum.add_trace(go.Scatter3d(
+                        x=contours_target_sum_bspline[i][:, 0],
+                        y=contours_target_sum_bspline[i][:, 1],
+                        z=contours_target_sum_bspline[i][:, 2],
+                        mode='markers',
+                        marker=dict(size=3, color='blue'),
+                        name=f'Cible {i}'
+                    ))
+                batch_fig_sum.update_layout(title="Batch ICP - Contours 'sum' après alignement", scene=dict(aspectmode='data'))
+                st.plotly_chart(batch_fig_sum, use_container_width=True)
+                
+                # Visualisation agrégée pour "diff" (affichage séparé pour gauche et droite)
+                batch_fig_diff = go.Figure()
+                for i, curve in enumerate(aligned_diff_left):
+                    batch_fig_diff.add_trace(go.Scatter3d(
+                        x=curve[:, 0],
+                        y=curve[:, 1],
+                        z=curve[:, 2],
+                        mode='markers',
+                        marker=dict(size=3, color='red'),
+                        name=f'Source ICP diff gauche {i}'
+                    ))
+                    batch_fig_diff.add_trace(go.Scatter3d(
+                        x=contours_target_diff_bspline[i][0][:, 0],
+                        y=contours_target_diff_bspline[i][0][:, 1],
+                        z=contours_target_diff_bspline[i][0][:, 2],
+                        mode='markers',
+                        marker=dict(size=3, color='blue'),
+                        name=f'Cible diff gauche {i}'
+                    ))
+                for i, curve in enumerate(aligned_diff_right):
+                    batch_fig_diff.add_trace(go.Scatter3d(
+                        x=curve[:, 0],
+                        y=curve[:, 1],
+                        z=curve[:, 2],
+                        mode='markers',
+                        marker=dict(size=3, color='orange'),
+                        name=f'Source ICP diff droite {i}'
+                    ))
+                    batch_fig_diff.add_trace(go.Scatter3d(
+                        x=contours_target_diff_bspline[i][1][:, 0],
+                        y=contours_target_diff_bspline[i][1][:, 1],
+                        z=contours_target_diff_bspline[i][1][:, 2],
+                        mode='markers',
+                        marker=dict(size=3, color='green'),
+                        name=f'Cible diff droite {i}'
+                    ))
+                batch_fig_diff.update_layout(title="Batch ICP - Contours 'diff' après alignement", scene=dict(aspectmode='data'))
+                st.plotly_chart(batch_fig_diff, use_container_width=True)
+                
+                # Affichage des métriques moyennes
+                avg_fitness_sum = np.mean([m[0] for m in metrics_sum])
+                avg_rmse_sum = np.mean([m[1] for m in metrics_sum])
+                avg_fitness_diff_left = np.mean([m[0] for m in metrics_diff_left])
+                avg_rmse_diff_left = np.mean([m[1] for m in metrics_diff_left])
+                avg_fitness_diff_right = np.mean([m[0] for m in metrics_diff_right])
+                avg_rmse_diff_right = np.mean([m[1] for m in metrics_diff_right])
+                st.write(f"[INFO] Moyenne des fitness (sum): {avg_fitness_sum:.4f} et RMSE: {avg_rmse_sum:.4f}")
+                st.write(f"[INFO] Moyenne des fitness (diff gauche): {avg_fitness_diff_left:.4f} et RMSE: {avg_rmse_diff_left:.4f}")
+                st.write(f"[INFO] Moyenne des fitness (diff droite): {avg_fitness_diff_right:.4f} et RMSE: {avg_rmse_diff_right:.4f}")
             
             st.markdown("""
             **Prochaines étapes expérimentales suggérées :**
             1. Varier les distances cibles et la tolérance pour l'extraction des contours et observer l'impact sur l'alignement ICP.
             2. Effectuer une PCA sur le système de coordonnées intrinsèque S(U,V) extrait des potentiels.
-            3. Comparer l'approche bipolaire (sum et diff) avec une approche à trois pôles pour déterminer la méthode la plus robuste.
+            3. Comparer l'approche bipolaire (sum et diff) avec une approche à trois pôles pour déterminer la méthode la plus générale et plus robuste.
             4. Envisager l'entraînement d'un modèle CNN pour la reconnaissance d'expressions basé sur ces représentations.
             """)
     else:
